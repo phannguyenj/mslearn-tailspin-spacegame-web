@@ -1,0 +1,216 @@
+trigger:
+  branches:
+    include:
+    - features/*/develop
+    - releases/*
+    - hotfixes/*
+    - master
+  paths:
+    include:
+    - src/*
+
+pool:
+  name: 'YDX Hosted'
+
+parameters:
+  - name: IncludeTest
+    displayName: Include test
+    type: string
+    default: 'yes'
+    values:
+      - 'yes'
+      - 'no'
+variables:
+  serviceName: 'configuration-service'
+  serviceShortName: 'Configuration'
+  tenant: yokogawa_ydx
+  acrName: ydxprivate
+steps:
+
+# Copy nuget file
+- task: Bash@3
+  inputs: 
+    targetType: 'inline'
+    script: |
+            cp -f ~/.config/NuGet/NuGet.Config ./NuGet.Config
+  displayName: 'Copy Nuget file' 
+
+- script: mono $(Agent.WorkFolder)/_tool/GitVersion/GitVersion.exe /output buildserver /nofetch
+  displayName: 'Fetch Version'
+ 
+- task: NuGetCommand@2
+  inputs:
+    command: custom
+    arguments: sources add -Name "framework" -Source "https://pkgs.dev.azure.com/ThanhTrungBui/_packaging/ThanhTrungBui/nuget/v3/index.json" -Username "vsts" -Password "$(System.AccessToken)" -StorePasswordInClearText -ConfigFile ./NuGet.Config
+  displayName: 'NuGet update credentials for NuGet.Config'
+
+- task: Docker@2
+  displayName: Login to ACR
+  inputs:
+    command: login
+    containerRegistry: ACR service connection
+  
+- task: Docker@2
+  displayName: Build Image
+  inputs:
+    command: build
+    containerRegistry: ACR service connection
+    repository: $(serviceName)
+    tags: |
+      $(GitVersion.SemVer)
+      latest
+
+- task: Bash@3
+  condition: eq('${{ parameters.IncludeTest }}', 'yes')
+  inputs:
+    targetType: 'inline'
+    script: |
+      # Set executable for build.sh
+      chmod +x build.sh
+      ./build.sh --target=Up
+  displayName: 'Boostup the container'
+
+- task: Bash@3
+  condition: eq('${{ parameters.IncludeTest }}', 'yes')
+  inputs:
+    targetType: 'inline'
+    script: |
+      # Set executable for build.sh
+      chmod +x build.sh
+      ./build.sh --target=MigrateIdp --serviceName=$(serviceName) --testFolder=tests/$(serviceShortName).IntegrationTest/sql/idp --tenant=$(tenant)
+  env:
+    ConnectionStrings__Default: $(ConnectionStrings-Idp)
+    ConnectionStrings__Master: $(ConnectionStrings-Idp-Master)  
+  displayName: 'Migrate Identity data'
+
+- task: Bash@3
+  condition: eq('${{ parameters.IncludeTest }}', 'yes')
+  inputs:
+    targetType: 'inline'
+    script: |
+      # Set executable for build.sh
+      chmod +x build.sh
+      ./build.sh --target=Migrate --serviceName=$(serviceName) --sql=sql --tenant=$(tenant)
+      ./build.sh --target=Migrate --serviceName=$(serviceName) --sql=tests/$(serviceShortName).IntegrationTest/sql --tenant=$(tenant)
+  env:
+    ConnectionStrings__Default: $(ConnectionStrings-Default)
+    ConnectionStrings__Master: $(ConnectionStrings-Default-Master)  
+  displayName: 'Migrate service data'
+
+- task: Bash@3
+  condition: eq('${{ parameters.IncludeTest }}', 'yes')
+  inputs:
+    targetType: 'inline'
+    script: |
+      # Set executable for sh
+      newman run -k -e '$(Build.SourcesDirectory)/tests/$(serviceShortName).IntegrationTest/AppData/Docker.postman_environment.json' '$(Build.SourcesDirectory)/tests/$(serviceShortName).IntegrationTest/AppData/Test.postman_collection.json'
+  displayName: 'Run test'  
+  continueOnError: true
+
+- task: Bash@3
+  condition: eq('${{ parameters.IncludeTest }}', 'yes')
+  inputs:
+    targetType: 'inline'
+    script: |
+      # Set executable for sh
+      rm -rf newman
+      newman run -k -e '$(Build.SourcesDirectory)/tests/$(serviceShortName).IntegrationTest/AppData/Docker.postman_environment.json' '$(Build.SourcesDirectory)/tests/$(serviceShortName).IntegrationTest/AppData/Test.postman_collection.json' -r junitfull
+  displayName: 'Run unit test'
+  continueOnError: true
+
+- task: PublishTestResults@2
+  condition: eq('${{ parameters.IncludeTest }}', 'yes')
+  inputs:
+    testResultsFormat: 'JUnit'
+    testResultsFiles: '$(Build.SourcesDirectory)/newman/*.xml'
+  displayName: 'Publish unit test result'  
+
+
+- task: Bash@3
+  condition: eq('${{ parameters.IncludeTest }}', 'yes')
+  inputs:
+    targetType: 'inline'
+    script: |
+      # Set executable for sh
+      newman run -k -e '$(Build.SourcesDirectory)/tests/$(serviceShortName).IntegrationTest/AppData/Docker.postman_environment.json' '$(Build.SourcesDirectory)/tests/$(serviceShortName).IntegrationTest/AppData/Test.postman_collection.json' -r htmlextra --reporter-htmlextra-export ./result/$(serviceName).$(GitVersion.SemVer).html
+    workingDirectory: $(Build.SourcesDirectory)
+  displayName: 'Run unit with output html'
+
+- task: Bash@3
+  condition: eq('${{ parameters.IncludeTest }}', 'yes')
+  inputs:
+    targetType: 'inline'
+    script: |
+      # Set executable for build.sh
+      chmod +x build.sh
+      ./build.sh --target=IntegrationTest --projects=./**/*Test.csproj --serviceName=$(serviceName) --testFolder=tests/$(serviceShortName).IntegrationTest --tenant=$(tenant) --output=$(Build.SourcesDirectory)/testoutput
+  displayName: 'Run all test cases'
+  
+- task: PublishCodeCoverageResults@1
+  condition: eq('${{ parameters.IncludeTest }}', 'yes')
+  inputs:
+    codeCoverageTool: Cobertura
+    summaryFileLocation: '$(Build.SourcesDirectory)/testoutput/tests/coverage.cobertura.xml'
+  displayName: 'Publish code coverage'
+  continueOnError: true
+
+
+- task: Bash@3
+  condition: eq('${{ parameters.IncludeTest }}', 'yes')
+  inputs:
+    targetType: 'inline'
+    script: |
+      # Set executable for build.sh
+      chmod +x build.sh
+      ./build.sh --target=Down
+    workingDirectory: $(Build.SourcesDirectory)
+  displayName: 'Destroy the container'
+
+- task: Docker@2
+  displayName: Push to ACR
+  inputs:
+    command: push
+    containerRegistry: ACR service connection
+    repository: $(serviceName)
+    tags: |
+      $(GitVersion.SemVer)
+      latest
+
+
+- task: Bash@3
+  inputs:
+    targetType: 'inline'
+    script: |
+      # Remove current docker image
+      docker image rm $(acrName).azurecr.io/$(serviceName):latest
+      docker image rm $(acrName).azurecr.io/$(serviceName):$(GitVersion.SemVer)
+  displayName: 'Clean up docker images'
+
+- task: Bash@3
+  inputs:
+    targetType: 'inline'
+    script: |
+      # Set executable for build.sh
+      chmod +x build.sh
+      cp -vr sql/ build.sh build.ps1 build.cake $(Build.ArtifactStagingDirectory)
+  displayName: 'Copy migration data'
+
+- task: PublishBuildArtifacts@1
+  condition: eq('${{ parameters.IncludeTest }}', 'yes')
+  inputs:
+    pathToPublish: '$(Build.SourcesDirectory)/result' 
+    artifactName: 'test' 
+    #publishLocation: 'Container' # Options: container, filePath
+    #targetPath: # Required when publishLocation == FilePath
+    #parallel: false # Optional
+    #parallelCount: # Optional
+    #fileCopyOptions: #Optional
+
+  displayName: 'Publish test html data'
+
+- task: PublishBuildArtifacts@1
+  inputs:
+    PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+    ArtifactName: 'drop'
+    publishLocation: 'Container'
+  displayName: 'Publish application'  
